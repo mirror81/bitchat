@@ -104,6 +104,10 @@ final class BLEService: NSObject {
     // Test-only tap on the outbound pipeline so multi-node tests can ferry
     // packets between in-process service instances.
     var _test_onOutboundPacket: ((BitchatPacket) -> Void)?
+    /// May block a synthetic CoreBluetooth receive callback immediately
+    /// before it hands a packet to `messageQueue`.
+    var _test_beforeReceivePacketHandoff: (() -> Void)?
+    var _test_onReceivePacketHandoff: (() -> Void)?
     #endif
     private var selfBroadcastTracker = BLESelfBroadcastTracker()
     private let meshTopology = MeshTopologyTracker()
@@ -119,6 +123,7 @@ final class BLEService: NSObject {
     private struct PendingMeshPing {
         let peerID: PeerID
         let sentAt: Date
+        let lifecycleGeneration: UInt64
         let completion: @MainActor (MeshPingResult?) -> Void
         let timeout: DispatchWorkItem
     }
@@ -134,7 +139,7 @@ final class BLEService: NSObject {
     private let incomingFileStore = BLEIncomingFileStore()
     
     // Simple announce throttling
-    private var announceThrottle = BLEAnnounceThrottle()
+    private let announceThrottle = BLEAnnounceThrottle()
     
     // Application state tracking (thread-safe)
     #if os(iOS)
@@ -155,6 +160,10 @@ final class BLEService: NSObject {
     private var centralManager: CBCentralManager?
     private var peripheralManager: CBPeripheralManager?
     private var characteristic: CBMutableCharacteristic?
+    private let shouldInitializeBluetoothManagers: Bool
+    private let panicLifecycleLock = NSLock()
+    private var _isPanicSuspended: Bool
+    private var panicLifecycleGeneration: UInt64 = 0
     
     // MARK: - Identity
     
@@ -162,9 +171,7 @@ final class BLEService: NSObject {
     private let identityManager: SecureIdentityStateManagerProtocol
     private let keychain: KeychainManagerProtocol
     private let idBridge: NostrIdentityBridge
-    /// Binary form of `myPeerID`; same contract — mutated only inside a
-    /// `messageQueue` barrier via `refreshPeerIdentity()`.
-    private var myPeerIDData: Data = Data()
+    private let localIdentityState = BLELocalIdentityStateStore()
 
     // MARK: - Advertising Privacy
     // No Local Name by default for maximum privacy. No rotating alias.
@@ -275,10 +282,13 @@ final class BLEService: NSObject {
         keychain: KeychainManagerProtocol,
         idBridge: NostrIdentityBridge,
         identityManager: SecureIdentityStateManagerProtocol,
-        initializeBluetoothManagers: Bool = true
+        initializeBluetoothManagers: Bool = true,
+        startSuspendedForPanicRecovery: Bool = false
     ) {
         self.keychain = keychain
         self.idBridge = idBridge
+        self.shouldInitializeBluetoothManagers = initializeBluetoothManagers
+        self._isPanicSuspended = startSuspendedForPanicRecovery
         noiseService = NoiseEncryptionService(keychain: keychain)
         self.identityManager = identityManager
         super.init()
@@ -327,37 +337,90 @@ final class BLEService: NSObject {
         // any access from another queue (cross-queue reads use readLinkState).
         linkStateStore.assumeOwnership(of: bleQueue)
 
-        if initializeBluetoothManagers {
-            // Initialize BLE on background queue to prevent main thread blocking.
-            #if os(iOS)
-            let centralOptions: [String: Any] = [
-                CBCentralManagerOptionRestoreIdentifierKey: BLEService.centralRestorationID
-            ]
-            centralManager = CBCentralManager(delegate: self, queue: bleQueue, options: centralOptions)
-
-            let peripheralOptions: [String: Any] = [
-                CBPeripheralManagerOptionRestoreIdentifierKey: BLEService.peripheralRestorationID
-            ]
-            peripheralManager = CBPeripheralManager(delegate: self, queue: bleQueue, options: peripheralOptions)
-            #else
-            centralManager = CBCentralManager(delegate: self, queue: bleQueue)
-            peripheralManager = CBPeripheralManager(delegate: self, queue: bleQueue)
-            #endif
+        if !startSuspendedForPanicRecovery {
+            initializeBluetoothManagersIfNeeded()
         }
         
         // Single maintenance timer for all periodic tasks (dispatch-based for
         // determinism). Only run it when real Bluetooth managers exist.
         meshBackgroundEnabled = initializeBluetoothManagers
-        startMaintenanceTimer()
+        if !startSuspendedForPanicRecovery {
+            startMaintenanceTimer()
+        }
 
         // Publish initial empty state
         requestPeerDataPublish()
 
         // Initialize gossip sync manager
-        restartGossipManager()
+        if !startSuspendedForPanicRecovery {
+            restartGossipManager()
+        }
+    }
+
+    private var isPanicSuspended: Bool {
+        panicLifecycleLock.lock()
+        defer { panicLifecycleLock.unlock() }
+        return _isPanicSuspended
+    }
+
+    private func setPanicSuspended(_ suspended: Bool) {
+        panicLifecycleLock.lock()
+        if suspended {
+            panicLifecycleGeneration &+= 1
+        }
+        _isPanicSuspended = suspended
+        panicLifecycleLock.unlock()
+    }
+
+    private func capturePanicLifecycleGeneration() -> UInt64? {
+        panicLifecycleLock.lock()
+        defer { panicLifecycleLock.unlock() }
+        return _isPanicSuspended ? nil : panicLifecycleGeneration
+    }
+
+    private func isCurrentPanicLifecycleGeneration(_ generation: UInt64) -> Bool {
+        panicLifecycleLock.lock()
+        defer { panicLifecycleLock.unlock() }
+        return !_isPanicSuspended && panicLifecycleGeneration == generation
+    }
+
+    private func initializeBluetoothManagersIfNeeded() {
+        guard shouldInitializeBluetoothManagers,
+              centralManager == nil,
+              peripheralManager == nil,
+              !isPanicSuspended else { return }
+
+        // Initialize BLE on its dedicated delegate queue. On iOS, retain the
+        // restoration identifiers even when construction was deferred by a
+        // pending panic-recovery latch.
+        #if os(iOS)
+        let centralOptions: [String: Any] = [
+            CBCentralManagerOptionRestoreIdentifierKey:
+                BLEService.centralRestorationID
+        ]
+        centralManager = CBCentralManager(
+            delegate: self,
+            queue: bleQueue,
+            options: centralOptions
+        )
+
+        let peripheralOptions: [String: Any] = [
+            CBPeripheralManagerOptionRestoreIdentifierKey:
+                BLEService.peripheralRestorationID
+        ]
+        peripheralManager = CBPeripheralManager(
+            delegate: self,
+            queue: bleQueue,
+            options: peripheralOptions
+        )
+        #else
+        centralManager = CBCentralManager(delegate: self, queue: bleQueue)
+        peripheralManager = CBPeripheralManager(delegate: self, queue: bleQueue)
+        #endif
     }
     
     private func restartGossipManager() {
+        guard !isPanicSuspended else { return }
         // Stop existing
         gossipSyncManager?.stop()
         
@@ -416,8 +479,42 @@ final class BLEService: NSObject {
         #endif
     }
 
-    func resetIdentityForPanic(currentNickname: String) {
-        messageQueue.sync(flags: .barrier) {
+    /// Close radio admission before application state starts disappearing.
+    /// CoreBluetooth callbacks consult the same gate and cannot restart scan
+    /// or advertising while the full panic transaction is incomplete.
+    func suspendForPanicReset() {
+        setPanicSuspended(true)
+        gossipSyncManager?.stop()
+        gossipSyncManager = nil
+        // Stop the radio and drain CoreBluetooth's delegate queue first. A
+        // callback may already have passed its initial suspension check; the
+        // bleQueue drain forces its final messageQueue handoff to happen
+        // before the receive barrier below.
+        stopServicesImmediatelyForPanic()
+        // Drain every receive/send submitted by callbacks that finished ahead
+        // of the radio stop. Later callbacks observe the closed lifecycle, and
+        // generation-bound handoffs that raced this barrier reject themselves.
+        messageQueue.sync(flags: .barrier) {}
+        clearEmergencySessionState()
+    }
+
+    /// Reopen the radio only after media deletion and recovery-marker commit.
+    func completePanicReset(restartServices: Bool) {
+        setPanicSuspended(false)
+        guard restartServices else { return }
+        startServices()
+        sendAnnounce(forceSend: true)
+    }
+
+    func resetIdentityForPanic(
+        currentNickname: String,
+        restartServices: Bool = true
+    ) {
+        gossipSyncManager?.stop()
+        gossipSyncManager = nil
+        // pendingNoiseSessionQueues is owned by collectionsQueue everywhere
+        // else, so clear it there too rather than on messageQueue.
+        collectionsQueue.sync(flags: .barrier) {
             pendingNoiseSessionQueues.removeAll()
         }
 
@@ -460,16 +557,21 @@ final class BLEService: NSObject {
             configureNoiseServiceCallbacks(for: newNoise)
             refreshPeerIdentity()
         }
-        restartGossipManager()
-
-        setNickname(currentNickname)
-
+        // Keep the transport silent until the application-level transaction
+        // has also removed its media and committed both recovery markers.
+        // Set through the identity store directly (not setNickname(_:), which
+        // would force-send an announce and break that silence).
+        localIdentityState.setNickname(currentNickname)
         messageDeduplicator.reset()
         messageQueue.async(flags: .barrier) { [weak self] in
             self?.selfBroadcastTracker.removeAll()
         }
         requestPeerDataPublish()
-        startServices()
+        if restartServices {
+            restartGossipManager()
+            startServices()
+            sendAnnounce(forceSend: true)
+        }
     }
     
     // Ensure this runs on message queue to avoid main thread blocking
@@ -481,6 +583,7 @@ final class BLEService: NSObject {
             }
             return
         }
+        guard !isPanicSuspended else { return }
         
         guard content.count <= maxMessageLength else {
             SecureLogger.error("Message too long: \(content.count) chars", category: .session)
@@ -537,20 +640,17 @@ final class BLEService: NSObject {
     
     // MARK: Identity
 
-    /// Derived from the Noise identity fingerprint; rotated only via
-    /// `refreshPeerIdentity()` (e.g. panic reset), which performs the swap
-    /// inside a `messageQueue` barrier so concurrent queue work never sees a
-    /// half-updated identity. Externally read-only — no out-of-band mutation
-    /// may bypass that derivation.
-    private(set) var myPeerID = PeerID(str: "")
-    /// Externally read-only; mutate via `setNickname(_:)`, which also
-    /// broadcasts the change to peers.
-    private(set) var myNickname: String = "anon"
+    /// Derived from the Noise identity fingerprint. Reads can originate from
+    /// the main actor, message queue, Bluetooth queue, and maintenance timer,
+    /// so all three local identity fields live in one lock-backed snapshot.
+    var myPeerID: PeerID { localIdentityState.snapshot().peerID }
+    var myNickname: String { localIdentityState.snapshot().nickname }
+    private var myPeerIDData: Data { localIdentityState.snapshot().peerIDData }
 
     /// Sole mutator for `myNickname`: updates the stored value and force-sends
     /// an announce so peers learn the new name.
     func setNickname(_ nickname: String) {
-        self.myNickname = nickname
+        localIdentityState.setNickname(nickname)
         // Send announce to notify peers of nickname change (force send)
         sendAnnounce(forceSend: true)
     }
@@ -562,7 +662,9 @@ final class BLEService: NSObject {
     /// `startServices()` — the latter matters after a panic reset, where
     /// `stopServices()` cancels and nils the timer.
     private func startMaintenanceTimer() {
-        guard meshBackgroundEnabled, maintenanceTimer == nil else { return }
+        guard !isPanicSuspended,
+              meshBackgroundEnabled,
+              maintenanceTimer == nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: bleQueue)
         timer.schedule(deadline: .now() + TransportConfig.bleMaintenanceInterval,
                        repeating: TransportConfig.bleMaintenanceInterval,
@@ -575,6 +677,12 @@ final class BLEService: NSObject {
     }
 
     func startServices() {
+        guard let lifecycleGeneration =
+                capturePanicLifecycleGeneration() else { return }
+        initializeBluetoothManagersIfNeeded()
+        if gossipSyncManager == nil {
+            restartGossipManager()
+        }
         // Restart the maintenance timer if a prior stopServices() cancelled it
         // (e.g. the panic flow), otherwise periodic announces, peer reconciliation
         // and cache cleanup would never resume until app restart.
@@ -591,15 +699,20 @@ final class BLEService: NSObject {
         // Send initial announce after services are ready
         // Use longer delay to avoid conflicts with other announces
         messageQueue.asyncAfter(deadline: .now() + TransportConfig.bleInitialAnnounceDelaySeconds) { [weak self] in
-            self?.sendAnnounce(forceSend: true)
+            guard let self,
+                  self.isCurrentPanicLifecycleGeneration(
+                    lifecycleGeneration
+                  ) else { return }
+            self.sendAnnounce(forceSend: true)
         }
     }
     
     func stopServices() {
+        let localIdentity = localIdentityState.snapshot()
         // Send leave message synchronously to ensure delivery
         var leavePacket = BitchatPacket(
             type: MessageType.leave.rawValue,
-            senderID: myPeerIDData,
+            senderID: localIdentity.peerIDData,
             recipientID: nil,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
             payload: Data(),
@@ -659,26 +772,62 @@ final class BLEService: NSObject {
             centralManager?.cancelPeripheralConnection(state.peripheral)
         }
     }
+
+    /// Panic cannot spend its security boundary sending a signed LEAVE or
+    /// pumping the main run loop. Close the radio and timers immediately;
+    /// the identity/session cleanup follows synchronously.
+    private func stopServicesImmediatelyForPanic() {
+        collectionsQueue.sync(flags: .barrier) {
+            pendingNotifications.removeAll()
+        }
+
+        maintenanceTimer?.cancel()
+        maintenanceTimer = nil
+        scanDutyTimer?.cancel()
+        scanDutyTimer = nil
+
+        centralManager?.stopScan()
+        peripheralManager?.stopAdvertising()
+
+        let peripheralsToDisconnect = bleQueue.sync {
+            linkStateStore.peripheralStates
+        }
+        for state in peripheralsToDisconnect {
+            centralManager?.cancelPeripheralConnection(state.peripheral)
+        }
+    }
     
     func emergencyDisconnectAll() {
         stopServices()
+        clearEmergencySessionState()
+    }
 
+    private func clearEmergencySessionState() {
         // Clear all sessions and peers
-        let cancelledTransfers: [(id: String, items: [DispatchWorkItem])] = collectionsQueue.sync(flags: .barrier) {
-            let entries = outboundFragmentTransfers.removeAll().map { ($0.id, $0.workItems) }
+        let cancelled = collectionsQueue.sync(flags: .barrier) {
+            let entries = outboundFragmentTransfers.removeAll().map {
+                (id: $0.id, items: $0.workItems)
+            }
+            let pingTimeouts = pendingMeshPings.values.map(\.timeout)
+            pendingMeshPings.removeAll()
+            meshPingResponseLimiter = SyncResponseRateLimiter(
+                maxResponses: TransportConfig.meshPingInboundMaxPerLink,
+                window: TransportConfig.meshPingInboundWindowSeconds
+            )
             peerRegistry.removeAll()
             fragmentAssemblyBuffer.removeAll()
             sourceRouteFailures = BLESourceRouteFailureCache()
             // Also clear pending message queues to avoid stale state across sessions
             pendingNoiseSessionQueues.removeAll()
             pendingDirectedRelays.removeAll()
-            return entries
+            return (transfers: entries, pingTimeouts: pingTimeouts)
         }
 
-        for entry in cancelledTransfers {
+        for entry in cancelled.transfers {
             entry.items.forEach { $0.cancel() }
             TransferProgressManager.shared.cancel(id: entry.id)
         }
+        cancelled.pingTimeouts.forEach { $0.cancel() }
 
         // Clear processed messages
         messageDeduplicator.reset()
@@ -899,6 +1048,7 @@ final class BLEService: NSObject {
     func sendFileBroadcast(_ filePacket: BitchatFilePacket, transferId: String) {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
+            guard !self.isPanicSuspended else { return }
             guard let payload = filePacket.encode() else {
                 SecureLogger.error("❌ Failed to encode file packet for broadcast", category: .session)
                 return
@@ -935,6 +1085,7 @@ final class BLEService: NSObject {
     func sendFilePrivate(_ filePacket: BitchatFilePacket, to peerID: PeerID, transferId: String) {
         messageQueue.async { [weak self] in
             guard let self = self else { return }
+            guard !self.isPanicSuspended else { return }
             guard let payload = filePacket.encode() else {
                 SecureLogger.error("❌ Failed to encode file packet for private send", category: .session)
                 return
@@ -1088,6 +1239,7 @@ final class BLEService: NSObject {
     // MARK: - Packet Broadcasting
     
     private func broadcastPacket(_ packet: BitchatPacket, transferId: String? = nil) {
+        guard !isPanicSuspended else { return }
         // Apply route if recipient exists (centralized route application)
         let packetToSend: BitchatPacket
         if let recipientPeerID = PeerID(hexData: packet.recipientID) {
@@ -1169,8 +1321,10 @@ final class BLEService: NSObject {
     }
 
     private func enqueuePendingNotification(data: Data, centrals: [CBCentral]?, context: String, attempt: Int = 0) {
+        guard !isPanicSuspended else { return }
         collectionsQueue.async(flags: .barrier) { [weak self] in
             guard let self = self else { return }
+            guard !self.isPanicSuspended else { return }
             let result = self.pendingNotifications.enqueue(
                 data: data,
                 targets: centrals,
@@ -1271,6 +1425,7 @@ final class BLEService: NSObject {
         requireDirectPeerLink: Bool = false,
         requireNoiseAuthenticatedPeerLink: Bool = false
     ) -> Bool {
+        guard !isPanicSuspended else { return false }
         let ingressRecord = collectionsQueue.sync { ingressLinks.record(for: packet) }
         var excludedPeerLinks = links(to: ingressRecord?.peerID)
         if requireNoiseAuthenticatedPeerLink {
@@ -1421,6 +1576,7 @@ final class BLEService: NSObject {
     }
 
     private func flushDirectedSpool() {
+        guard !isPanicSuspended else { return }
         // Move items out and attempt broadcast; if still no links, they'll be re-spooled
         let toSend = collectionsQueue.sync(flags: .barrier) {
             pendingDirectedRelays.drainUnexpired(
@@ -1464,22 +1620,40 @@ final class BLEService: NSObject {
     }
 
     func collectArchivedPublicMessages(completion: @escaping @MainActor ([ArchivedPublicMessage]) -> Void) {
+        guard let generation = capturePanicLifecycleGeneration() else {
+            return
+        }
         guard let sync = gossipSyncManager else {
-            Task { @MainActor in completion([]) }
+            notifyUI { [weak self] in
+                guard let self,
+                      self.isCurrentPanicLifecycleGeneration(generation) else {
+                    return
+                }
+                completion([])
+            }
             return
         }
         sync.collectPublicMessagePackets { [weak self] packets in
-            guard let self = self else {
-                Task { @MainActor in completion([]) }
+            guard let self,
+                  self.isCurrentPanicLifecycleGeneration(generation) else {
                 return
             }
             // Signature verification and registry lookups run on messageQueue
             // like the live receive path.
             self.messageQueue.async {
+                guard self.isCurrentPanicLifecycleGeneration(generation) else {
+                    return
+                }
                 let decoded = packets
                     .compactMap { self.decodeArchivedPublicMessage($0) }
                     .sorted { $0.timestamp < $1.timestamp }
-                Task { @MainActor in completion(decoded) }
+                self.notifyUI { [weak self] in
+                    guard let self,
+                          self.isCurrentPanicLifecycleGeneration(generation) else {
+                        return
+                    }
+                    completion(decoded)
+                }
             }
         }
     }
@@ -1618,7 +1792,44 @@ final class BLEService: NSObject {
         }
     }
 
-    private func handleLeave(_: BitchatPacket, from peerID: PeerID) {
+    /// Accept a leave only when the claimed sender proves possession of the
+    /// signing key bound by a verified announce. The persisted identity cache
+    /// keeps delayed/relayed leaves verifiable after the live registry entry
+    /// has aged out.
+    private func handleLeave(_ packet: BitchatPacket, from peerID: PeerID) -> Bool {
+        let registrySigningKey = collectionsQueue.sync {
+            peerRegistry.info(for: peerID)?.signingPublicKey
+        }
+        let verifiedViaRegistry = registrySigningKey.map {
+            noiseService.verifyPacketSignature(packet, publicKey: $0)
+        } ?? false
+        let verifiedViaPersistedIdentity = !verifiedViaRegistry
+            && identityManager.getCryptoIdentitiesByPeerIDPrefix(peerID).contains { identity in
+                PeerID(publicKey: identity.publicKey) == peerID
+                    && identity.signingPublicKey.map {
+                        noiseService.verifyPacketSignature(packet, publicKey: $0)
+                    } == true
+            }
+
+        guard verifiedViaRegistry || verifiedViaPersistedIdentity else {
+            SecureLogger.warning(
+                "🚫 Dropping leave with missing/invalid signature for claimed sender \(peerID.id.prefix(8))…",
+                category: .security
+            )
+            return false
+        }
+
+        // A valid departure retires transport state too; otherwise
+        // canDeliverSecurely could remain true for a peer we just removed.
+        noiseService.clearSession(for: peerID)
+        readLinkState { _ in
+            let departedLinks = noiseAuthenticatedLinkOwners.compactMap { link, owner in
+                owner == peerID ? link : nil
+            }
+            for link in departedLinks {
+                noiseAuthenticatedLinkOwners.removeValue(forKey: link)
+            }
+        }
         _ = collectionsQueue.sync(flags: .barrier) {
             // Remove the peer when they leave
             peerRegistry.remove(peerID)
@@ -1635,8 +1846,23 @@ final class BLEService: NSObject {
             self.deliverTransportEvent(.peerDisconnected(peerID))
             self.deliverTransportEvent(.peerListUpdated(currentPeerIDs))
         }
+        return true
     }
     private func sendAnnounce(forceSend: Bool = false) {
+        guard !isPanicSuspended else { return }
+        // Announce construction reads the replaceable Noise service and several
+        // related state snapshots. Serialize the whole operation with identity
+        // rotation instead of letting CoreBluetooth and maintenance callbacks
+        // execute it directly on their own queues.
+        messageQueue.async(flags: .barrier) { [weak self] in
+            self?.sendAnnounceNow(forceSend: forceSend)
+        }
+    }
+
+    private func sendAnnounceNow(forceSend: Bool) {
+        // Re-check on the serialized queue: a panic suspend may have started
+        // after this announce was scheduled but before it runs.
+        guard !isPanicSuspended else { return }
         // Throttle announces to prevent flooding
         if !announceThrottle.shouldSend(force: forceSend, now: Date()) {
             return
@@ -1656,8 +1882,9 @@ final class BLEService: NSObject {
             )
         }
 
+        let localIdentity = localIdentityState.snapshot()
         let announcement = AnnouncementPacket(
-            nickname: myNickname,
+            nickname: localIdentity.nickname,
             noisePublicKey: noisePub,
             signingPublicKey: signingPub,
             directNeighbors: connectedPeerIDs,
@@ -1673,7 +1900,7 @@ final class BLEService: NSObject {
         // Create packet with signature using the noise private key
         let packet = BitchatPacket(
             type: MessageType.announce.rawValue,
-            senderID: myPeerIDData,
+            senderID: localIdentity.peerIDData,
             recipientID: nil,
             timestamp: UInt64(Date().timeIntervalSince1970 * 1000),
             payload: payload,
@@ -1687,14 +1914,7 @@ final class BLEService: NSObject {
             return
         }
         
-        // Call directly if on messageQueue, otherwise dispatch
-        if DispatchQueue.getSpecific(key: messageQueueKey) != nil {
-            broadcastPacket(signedPacket)
-        } else {
-            messageQueue.async { [weak self] in
-                self?.broadcastPacket(signedPacket)
-            }
-        }
+        broadcastPacket(signedPacket)
         // Ensure our own announce is included in sync state
         gossipSyncManager?.onPublicPacketSeen(signedPacket)
 
@@ -1846,6 +2066,13 @@ extension BLEService: CBCentralManagerDelegate {
     #if os(iOS)
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         let restoredPeripherals = (dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral]) ?? []
+        guard !isPanicSuspended else {
+            central.stopScan()
+            restoredPeripherals.forEach {
+                central.cancelPeripheralConnection($0)
+            }
+            return
+        }
         let restoredServices = (dict[CBCentralManagerRestoredStateScanServicesKey] as? [CBUUID]) ?? []
         let restoredOptions = (dict[CBCentralManagerRestoredStateScanOptionsKey] as? [String: Any]) ?? [:]
         let allowDuplicates = restoredOptions[CBCentralManagerScanOptionAllowDuplicatesKey] as? Bool
@@ -1901,6 +2128,10 @@ extension BLEService: CBCentralManagerDelegate {
 
         switch central.state {
         case .poweredOn:
+            guard !isPanicSuspended else {
+                central.stopScan()
+                return
+            }
             // Links restored as connected have no characteristic in the new
             // process; without rediscovery they sit connected-but-unusable
             // until the peer disconnects. Runs here (not willRestoreState)
@@ -1957,7 +2188,8 @@ extension BLEService: CBCentralManagerDelegate {
     }
     
     private func startScanning() {
-        guard let central = centralManager,
+        guard !isPanicSuspended,
+              let central = centralManager,
               central.state == .poweredOn,
               !central.isScanning else { return }
         
@@ -1978,6 +2210,7 @@ extension BLEService: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String: Any], rssi RSSI: NSNumber) {
+        guard !isPanicSuspended else { return }
         let peripheralID = peripheral.identifier.uuidString
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? (peripheralID.prefix(6) + "…")
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
@@ -2019,6 +2252,10 @@ extension BLEService: CBCentralManagerDelegate {
     }
     
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard !isPanicSuspended else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
         let peripheralID = peripheral.identifier.uuidString
 
         #if os(iOS)
@@ -2169,7 +2406,9 @@ private extension CBPeripheralState {
 
 extension BLEService {
     private func tryConnectFromQueue() {
-        guard let central = centralManager, central.state == .poweredOn else { return }
+        guard !isPanicSuspended,
+              let central = centralManager,
+              central.state == .poweredOn else { return }
 
         let decision = connectionScheduler.nextCandidate(
             connectedOrConnectingCount: linkStateStore.connectedOrConnectingPeripheralCount,
@@ -2195,6 +2434,7 @@ extension BLEService {
         using central: CBCentralManager,
         logPrefix: String
     ) {
+        guard !isPanicSuspended else { return }
         let peripheral = candidate.peripheral
         let peripheralID = candidate.peripheralID
         linkStateStore.beginConnecting(to: peripheral, at: Date())
@@ -2255,6 +2495,28 @@ private extension BLEService {
 #if DEBUG
 // Test-only helper to inject packets into the receive pipeline
 extension BLEService {
+    /// Queues an event through the same MainActor hop as production receive
+    /// handlers so panic-boundary tests can deterministically invalidate it.
+    func _test_emitTransportEvent(_ event: TransportEvent) {
+        emitTransportEvent(event)
+    }
+
+    var _test_isPanicIngressOpen: Bool {
+        capturePanicLifecycleGeneration() != nil
+    }
+
+    /// Models a CoreBluetooth delegate callback without requiring a physical
+    /// peripheral. The callback itself runs on `bleQueue`, exactly where the
+    /// panic radio-stop barrier must linearize it.
+    func _test_handlePacketFromBLEQueue(
+        _ packet: BitchatPacket,
+        fromPeerID: PeerID
+    ) {
+        bleQueue.async { [weak self] in
+            self?.handleReceivedPacket(packet, from: fromPeerID)
+        }
+    }
+
     func _test_handlePacket(_ packet: BitchatPacket, fromPeerID: PeerID, preseedPeer: Bool = true, signingPublicKey: Data? = nil) {
         if preseedPeer {
             // Ensure the synthetic peer is known and marked verified for public-message tests
@@ -2336,6 +2598,12 @@ extension BLEService {
         }
     }
 
+    func _test_isNoiseAuthenticatedCentral(_ centralUUID: String, for peerID: PeerID) -> Bool {
+        bleQueue.sync {
+            noiseAuthenticatedLinkOwners[.central(centralUUID)] == peerID
+        }
+    }
+
     func _test_seedConnectedPeer(_ peerID: PeerID, nickname: String) {
         collectionsQueue.sync(flags: .barrier) {
             peerRegistry.upsert(BLEPeerInfo(
@@ -2376,6 +2644,7 @@ extension BLEService {
 
 extension BLEService: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard !isPanicSuspended else { return }
         if let error = error {
             SecureLogger.error("❌ Error discovering services for \(peripheral.name ?? "Unknown"): \(error.localizedDescription)", category: .session)
             // Retry service discovery after a delay
@@ -2402,6 +2671,7 @@ extension BLEService: CBPeripheralDelegate {
     }
     
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        guard !isPanicSuspended else { return }
         if let error = error {
             SecureLogger.error("❌ Error discovering characteristics for \(peripheral.name ?? "Unknown"): \(error.localizedDescription)", category: .session)
             return
@@ -2449,6 +2719,7 @@ extension BLEService: CBPeripheralDelegate {
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard !isPanicSuspended else { return }
         if let error = error {
             SecureLogger.error("❌ Error receiving notification: \(error.localizedDescription)", category: .session)
             return
@@ -2566,6 +2837,7 @@ extension BLEService: CBPeripheralDelegate {
     }
     
     func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        guard !isPanicSuspended else { return }
         // Resume queued writes for this peripheral - called when canSendWriteWithoutResponse becomes true again
         if logRateLimiter.shouldLog(key: "peripheral-ready:\(peripheral.identifier.uuidString)") {
             SecureLogger.debug("📤 Peripheral \(peripheral.name ?? peripheral.identifier.uuidString.prefix(8).description) ready for more writes", category: .session)
@@ -2574,6 +2846,7 @@ extension BLEService: CBPeripheralDelegate {
     }
     
     func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        guard !isPanicSuspended else { return }
         SecureLogger.warning("⚠️ Services modified for \(peripheral.name ?? peripheral.identifier.uuidString)", category: .session)
 
         let shouldRediscover = BLEService.shouldRediscoverBitChatService(
@@ -2594,6 +2867,7 @@ extension BLEService: CBPeripheralDelegate {
     }
     
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        guard !isPanicSuspended else { return }
         if let error = error {
             SecureLogger.error("❌ Error updating notification state: \(error.localizedDescription)", category: .session)
         } else {
@@ -2617,6 +2891,12 @@ extension BLEService: CBPeripheralManagerDelegate {
 
         switch peripheral.state {
         case .poweredOn:
+            guard !isPanicSuspended else {
+                peripheral.stopAdvertising()
+                peripheral.removeAllServices()
+                characteristic = nil
+                return
+            }
             // Remove all services first to ensure clean state
             peripheral.removeAllServices()
 
@@ -2677,6 +2957,12 @@ extension BLEService: CBPeripheralManagerDelegate {
     
     #if os(iOS)
     func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
+        guard !isPanicSuspended else {
+            peripheral.stopAdvertising()
+            peripheral.removeAllServices()
+            characteristic = nil
+            return
+        }
         let restoredServices = (dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService]) ?? []
         let restoredAdvertisement = (dict[CBPeripheralManagerRestoredStateAdvertisementDataKey] as? [String: Any]) ?? [:]
 
@@ -2703,6 +2989,10 @@ extension BLEService: CBPeripheralManagerDelegate {
     #endif
     
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
+        guard !isPanicSuspended else {
+            peripheral.stopAdvertising()
+            return
+        }
         if let error = error {
             SecureLogger.error("❌ Failed to add service: \(error.localizedDescription)", category: .session)
             return
@@ -2718,6 +3008,7 @@ extension BLEService: CBPeripheralManagerDelegate {
     }
     
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral, didSubscribeTo characteristic: CBCharacteristic) {
+        guard !isPanicSuspended else { return }
         let centralUUID = central.identifier.uuidString
         SecureLogger.debug("📥 Central subscribed: \(centralUUID.prefix(8))…", category: .session)
         linkStateStore.addSubscribedCentral(central)
@@ -2759,7 +3050,7 @@ extension BLEService: CBPeripheralManagerDelegate {
         let removedPeerID = linkStateStore.removeSubscribedCentral(central)
         
         // Ensure we're still advertising for other devices to find us
-        if peripheral.isAdvertising == false {
+        if !isPanicSuspended, peripheral.isAdvertising == false {
             SecureLogger.debug("📡 Restarting advertising after central unsubscribed", category: .session)
             peripheral.startAdvertising(buildAdvertisementData())
         }
@@ -2796,6 +3087,7 @@ extension BLEService: CBPeripheralManagerDelegate {
     }
     
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
+        guard !isPanicSuspended else { return }
         drainPendingNotifications(logPrefix: "✅ Sent")
     }
 
@@ -2856,6 +3148,7 @@ extension BLEService: CBPeripheralManagerDelegate {
         for request in requests {
             peripheral.respond(to: request, withResult: .success)
         }
+        guard !isPanicSuspended else { return }
         
         // Process writes. For long writes, CoreBluetooth may deliver multiple CBATTRequest values with offsets.
         // Combine per-central request values by offset before decoding.
@@ -2965,8 +3258,18 @@ extension BLEService {
     
     /// Notify UI on the MainActor to satisfy Swift concurrency isolation
     private func notifyUI(_ block: @escaping @MainActor () -> Void) {
-        // Always hop onto the MainActor so calls to @MainActor delegates are safe
-        Task { @MainActor in
+        // Capture the panic lifecycle before queueing the MainActor hop. A
+        // receive callback can enqueue UI delivery immediately before panic
+        // clears application state; rechecking here prevents that stale work
+        // from repopulating the wiped conversation store afterward.
+        guard let generation = capturePanicLifecycleGeneration() else {
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self,
+                  self.isCurrentPanicLifecycleGeneration(generation) else {
+                return
+            }
             block()
         }
     }
@@ -3131,14 +3434,24 @@ extension BLEService {
     /// The completion fires exactly once on the main actor: with RTT/hops
     /// when the matching pong returns, or nil after the timeout window.
     func sendMeshPing(to peerID: PeerID, completion: @escaping @MainActor (MeshPingResult?) -> Void) {
+        guard let generation = capturePanicLifecycleGeneration() else {
+            return
+        }
         messageQueue.async { [weak self] in
             guard let self,
+                  self.isCurrentPanicLifecycleGeneration(generation),
                   let recipientData = peerID.toShort().routingData,
                   let payload = MeshPingPayload(
                     nonce: Data((0..<MeshPingPayload.nonceLength).map { _ in UInt8.random(in: .min ... .max) }),
                     originTTL: self.messageTTL
                   ) else {
-                Task { @MainActor in completion(nil) }
+                self?.notifyUI { [weak self] in
+                    guard let self,
+                          self.isCurrentPanicLifecycleGeneration(generation) else {
+                        return
+                    }
+                    completion(nil)
+                }
                 return
             }
             let nonce = payload.nonce
@@ -3157,12 +3470,21 @@ extension BLEService {
                     self.pendingMeshPings.removeValue(forKey: nonce)
                 }
                 guard let expired else { return }
-                Task { @MainActor in expired.completion(nil) }
+                self.notifyUI { [weak self] in
+                    guard let self,
+                          self.isCurrentPanicLifecycleGeneration(
+                              expired.lifecycleGeneration
+                          ) else {
+                        return
+                    }
+                    expired.completion(nil)
+                }
             }
             self.collectionsQueue.sync(flags: .barrier) {
                 self.pendingMeshPings[nonce] = PendingMeshPing(
                     peerID: PeerID(hexData: recipientData),
                     sentAt: Date(),
+                    lifecycleGeneration: generation,
                     completion: completion,
                     timeout: timeout
                 )
@@ -3229,7 +3551,15 @@ extension BLEService {
             rttMs: max(0, rttMs),
             hops: MeshPingPayload.hopCount(originTTL: pong.originTTL, receivedTTL: packet.ttl)
         )
-        Task { @MainActor in pending.completion(result) }
+        notifyUI { [weak self] in
+            guard let self,
+                  self.isCurrentPanicLifecycleGeneration(
+                      pending.lifecycleGeneration
+                  ) else {
+                return
+            }
+            pending.completion(result)
+        }
     }
 
     /// Estimated intermediate hops toward `peerID`, BFS over gossiped
@@ -3358,8 +3688,9 @@ extension BLEService {
     private func refreshPeerIdentity() {
         let swap = {
             let fingerprint = self.noiseService.getIdentityFingerprint()
-            self.myPeerID = PeerID(str: fingerprint.prefix(16))
-            self.myPeerIDData = Data(hexString: self.myPeerID.id) ?? Data()
+            self.localIdentityState.replacePeerIdentity(
+                with: PeerID(str: fingerprint.prefix(16))
+            )
             self.meshTopology.reset()
         }
         if DispatchQueue.getSpecific(key: messageQueueKey) != nil {
@@ -3713,7 +4044,7 @@ extension BLEService {
         let store = courierStore
         let policy = courierDepositPolicy
         let metrics = sfMetrics
-        Task { @MainActor in
+        notifyUI {
             guard let tier = policy(depositorKey, isVerifiedPeer) else {
                 SecureLogger.debug("📦 Courier deposit from \(peerID.id.prefix(8))… rejected (neither favorite nor verified)", category: .session)
                 return
@@ -3793,7 +4124,7 @@ extension BLEService {
             }
         }
         let policy = courierDepositPolicy
-        Task { @MainActor in
+        notifyUI {
             // Same trust gate as deposits: don't hand mail to a peer who
             // would reject it from us.
             guard policy(noiseKey, isVerifiedPeer) != nil else { return }
@@ -4138,6 +4469,7 @@ extension BLEService {
         let uuid = peripheral.identifier.uuidString
         bleQueue.async { [weak self] in
             guard let self = self else { return }
+            guard !self.isPanicSuspended else { return }
             guard let state = self.linkStateStore.state(forPeripheralID: uuid), let ch = state.characteristic else { return }
 
             // Atomically take all pending items from the queue to avoid race conditions
@@ -4228,7 +4560,10 @@ extension BLEService {
         slotReserve: Int = TransportConfig.bleBackgroundPendingConnectSlotReserve
     ) {
         bleQueue.async { [weak self] in
-            guard let self, let central = self.centralManager, central.state == .poweredOn else { return }
+            guard let self,
+                  !self.isPanicSuspended,
+                  let central = self.centralManager,
+                  central.state == .poweredOn else { return }
             let budget = TransportConfig.bleMaxCentralLinks
                 - slotReserve
                 - self.linkStateStore.connectedOrConnectingPeripheralCount
@@ -4681,8 +5016,24 @@ extension BLEService {
     private func handleReceivedPacket(_ packet: BitchatPacket, from peerID: PeerID) {
         // Call directly if already on messageQueue, otherwise dispatch
         if DispatchQueue.getSpecific(key: messageQueueKey) == nil {
+            guard let lifecycleGeneration =
+                    capturePanicLifecycleGeneration() else {
+                return
+            }
+            #if DEBUG
+            _test_beforeReceivePacketHandoff?()
+            #endif
             messageQueue.async { [weak self] in
-                self?.handleReceivedPacket(packet, from: peerID)
+                guard let self,
+                      self.isCurrentPanicLifecycleGeneration(
+                          lifecycleGeneration
+                      ) else {
+                    return
+                }
+                #if DEBUG
+                self._test_onReceivePacketHandoff?()
+                #endif
+                self.handleReceivedPacket(packet, from: peerID)
             }
             return
         }
@@ -4785,7 +5136,9 @@ extension BLEService {
             handleMeshPong(packet, from: senderID)
 
         case .leave:
-            handleLeave(packet, from: senderID)
+            // A forged leave must neither evict the claimed peer nor spread
+            // to downstream nodes.
+            guard handleLeave(packet, from: senderID) else { return }
 
         case .none:
             SecureLogger.warning("⚠️ Unknown message type: \(packet.type)", category: .session)
@@ -5116,9 +5469,21 @@ extension BLEService {
             },
             messageTTL: messageTTL,
             now: { Date() },
-            existingNoisePublicKey: { [weak self] peerID in
+            existingPeerKeys: { [weak self] peerID in
+                guard let self = self else { return (nil, nil) }
+                return self.collectionsQueue.sync {
+                    let info = self.peerRegistry.info(for: peerID)
+                    return (info?.noisePublicKey, info?.signingPublicKey)
+                }
+            },
+            persistedSigningPublicKey: { [weak self] peerID in
+                // Same synchronous identity-manager read pattern as
+                // signedSenderDisplayName(for:from:); the manager serializes
+                // access on its own internal queue.
                 guard let self = self else { return nil }
-                return self.collectionsQueue.sync { self.peerRegistry.info(for: peerID)?.noisePublicKey }
+                return self.identityManager.getCryptoIdentitiesByPeerIDPrefix(peerID)
+                    .compactMap { $0.signingPublicKey }
+                    .first
             },
             verifySignature: { [weak self] packet, signingPublicKey in
                 self?.noiseService.verifyPacketSignature(packet, publicKey: signingPublicKey) ?? false
@@ -5150,16 +5515,24 @@ extension BLEService {
             },
             upsertVerifiedAnnounce: { [weak self] peerID, announcement, isConnected, now in
                 // Called from inside withRegistryBarrier; access registry directly.
-                self?.peerRegistry.upsertVerifiedAnnounce(
+                guard let self = self else {
+                    return BLEPeerAnnounceUpdate(isNewPeer: false, wasDisconnected: false, previousNickname: nil)
+                }
+                return self.peerRegistry.upsertVerifiedAnnounce(
                     peerID: peerID,
                     nickname: announcement.nickname,
                     noisePublicKey: announcement.noisePublicKey,
                     signingPublicKey: announcement.signingPublicKey,
                     isConnected: isConnected,
+                    // Propagate `nil` (registry refused the announce because it
+                    // carries a signing key different from the pinned one) so
+                    // the handler's guard rejects it instead of overwriting the
+                    // pinned identity. Main's capabilities/bridgeGeohash are
+                    // preserved.
                     now: now,
                     capabilities: announcement.capabilities ?? [],
                     bridgeGeohash: announcement.bridgeGeohash
-                ) ?? BLEPeerAnnounceUpdate(isNewPeer: false, wasDisconnected: false, previousNickname: nil)
+                )
             },
             shouldEmitReconnectLog: { [weak self] peerID, now in
                 // Called from inside withRegistryBarrier; access debouncer directly.
@@ -5425,9 +5798,11 @@ extension BLEService {
     }
 
     private func handleNoiseHandshake(_ packet: BitchatPacket, from peerID: PeerID) {
-        let wasEstablished = noiseService.hasEstablishedSession(with: peerID)
-        noisePacketHandler.handleHandshake(packet, from: peerID)
-        if !wasEstablished, noiseService.hasEstablishedSession(with: peerID) {
+        let result = noisePacketHandler.handleHandshakeWithResult(
+            packet,
+            from: peerID
+        )
+        if result.didEstablishAuthenticatedSession {
             markNoiseAuthenticatedIngressLink(for: packet, peerID: peerID)
         }
     }
@@ -5450,7 +5825,16 @@ extension BLEService {
             messageTTL: messageTTL,
             now: { Date() },
             processHandshakeMessage: { [weak self] peerID, message in
-                try self?.noiseService.processHandshakeMessage(from: peerID, message: message)
+                guard let self else {
+                    return NoiseHandshakeProcessingResult(
+                        response: nil,
+                        didEstablishAuthenticatedSession: false
+                    )
+                }
+                return try self.noiseService.processHandshakeMessageWithResult(
+                    from: peerID,
+                    message: message
+                )
             },
             hasNoiseSession: { [weak self] peerID in
                 self?.noiseService.hasSession(with: peerID) ?? false
@@ -5526,8 +5910,7 @@ extension BLEService {
         let transportPeers: [TransportPeerSnapshot] = collectionsQueue.sync {
             peerRegistry.transportSnapshots(selfNickname: myNickname)
         }
-        // Notify UI on MainActor via delegate
-        Task { @MainActor [weak self] in
+        notifyUI { [weak self] in
             self?.peerEventsDelegate?.didUpdatePeerSnapshots(transportPeers)
         }
     }
@@ -5535,6 +5918,7 @@ extension BLEService {
     // MARK: Consolidated Maintenance
     
     private func performMaintenance() {
+        guard !isPanicSuspended else { return }
         maintenanceCounter += 1
         lastMaintenanceAt = Date()
 
