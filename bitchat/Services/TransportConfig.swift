@@ -9,6 +9,19 @@ enum TransportConfig {
     static let bleMaxInFlightAssemblies: Int = 128          // Cap concurrent fragment assemblies
     static let bleHighDegreeThreshold: Int = 6              // For adaptive TTL/probabilistic relays
     static let bleMaxConcurrentTransfers: Int = 2           // Limit simultaneous large media sends
+    // Bounded wait for the session-authenticated capability proof used by
+    // private-media migration. Expiry never auto-sends clear bytes; it only
+    // resolves to the existing one-shot consent or downgrade-blocked path.
+    static let privateMediaCapabilityProofTimeoutSeconds: TimeInterval = 5
+    static let privateMediaCapabilityProofPendingPeerCap: Int = 64
+    static let privateMediaCapabilityProofWaitersPerPeerCap: Int = 16
+    /// Accepted private-media receipts and explicit-deletion tombstones each
+    /// receive this independent capacity.
+    static let privateMediaReceivedLedgerCapacity: Int = 4_096
+    /// A bounded retry horizon prevents stable receipt state from growing into
+    /// permanent application history.
+    static let privateMediaReceivedLedgerTTLSeconds: TimeInterval =
+        7 * 24 * 60 * 60
     static let bleFragmentRelayMinDelayMs: Int = 8          // Faster forwarding for media fragments
     static let bleFragmentRelayMaxDelayMs: Int = 25         // Upper jitter bound for fragment relays
     // Fragment relay TTL in sparse graphs; matches messageTTLDefault so media
@@ -246,7 +259,7 @@ enum TransportConfig {
     // Fallback deadline for treating a subscription's initial fetch as complete
     // when a relay never sends EOSE (generous to cover Tor circuit setup).
     static let nostrSubscriptionEOSEFallbackSeconds: TimeInterval = 10.0
-    // A bridge drop is durable only after NIP-20 OK. Relays that omit OK must
+    // A bridge drop is durable only after NIP-01 `OK`. Relays that omit OK must
     // not pin the router's in-flight state indefinitely.
     static let nostrConfirmedSendAckTimeoutSeconds: TimeInterval = 10.0
     // After this long, a relay marked permanently failed gets another chance.
